@@ -25,7 +25,6 @@ jobs:
 
       - name: 安装 Chrome (macOS 真 GPU)
         run: |
-          # 禁用 brew 自动升级索引，节省 2-5 分钟 runner 运行时间
           export HOMEBREW_NO_AUTO_UPDATE=1
           brew install --cask google-chrome 2>/dev/null || true
           "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version || true
@@ -45,7 +44,6 @@ jobs:
         run: |
           python scripts/vless_helper.py
           
-          # 根据是否生成了配置文件决定是否安装并启动 sing-box
           if [ -f "/tmp/singbox.json" ]; then
             echo "[proxy] 检测到节点配置，开始准备 sing-box..."
             SINGBOX_VER="1.11.3"
@@ -61,7 +59,6 @@ jobs:
             nohup sing-box run -c /tmp/singbox.json > /tmp/singbox.log 2>&1 &
             sleep 3
             
-            # 代理通道探活测试（尝试 3 次）
             PROXY_OK=no
             for i in 1 2 3; do
               if curl -x socks5h://127.0.0.1:10808 -sI https://www.cloudflare.com/cdn-cgi/trace --connect-timeout 6 -m 10 >/dev/null 2>&1; then
@@ -78,14 +75,17 @@ jobs:
             else
               echo "::warning::[proxy] 代理握手失败，以下为 sing-box 实时错误日志："
               cat /tmp/singbox.log || true
-              echo "[proxy] 后续将以无代理或直连模式尝试（macOS 真 GPU 也可过盾）"
+              echo "[proxy] 后续将以无代理或直连模式尝试"
             fi
           else
-            echo "[proxy] 未配置 VLESS/代理节点，跳过安装（真 GPU 直连模式）"
+            echo "[proxy] 未配置 VLESS/代理节点，跳过安装（直连模式）"
           fi
 
       - name: 运行续期脚本
         env:
+          # 双重防线：显式排除本地回环，防止误走代理拦截驱动控制流
+          NO_PROXY: "localhost,127.0.0.1,::1"
+          no_proxy: "localhost,127.0.0.1,::1"
           WEIRDHOST_COOKIE_1: ${{ secrets.WEIRDHOST_COOKIE_1 }}
           WEIRDHOST_COOKIE_2: ${{ secrets.WEIRDHOST_COOKIE_2 }}
           WEIRDHOST_COOKIE_3: ${{ secrets.WEIRDHOST_COOKIE_3 }}
@@ -105,8 +105,6 @@ jobs:
           VLESS_NODE: ${{ secrets.VLESS_NODE }}
           TROJAN_NODE: ${{ secrets.TROJAN_NODE }}
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
-          HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
-          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
         run: |
           python scripts/weirdhost_renew.py
 
