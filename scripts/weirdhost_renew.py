@@ -43,16 +43,17 @@ RENEWAL_BUTTON_SELECTORS = [
 
 RENEW_THRESHOLD_DAYS = float(os.environ.get("RENEW_THRESHOLD_DAYS", "2"))
 
+
 def get_proxy_url():
     """家宽代理：按优先级读取 WEIRDHOST_PROXY > HTTPS_PROXY > HTTP_PROXY > https_proxy > http_proxy"""
     for k in ("WEIRDHOST_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
         v = os.environ.get(k, "").strip()
         if v:
-            # 兼容仅 host:port 形式，补 http://
             if "://" not in v:
                 v = "http://" + v
             return v
     return ""
+
 
 # ============================================================
 #  工具函数
@@ -168,7 +169,7 @@ def build_server_url(server_id):
 
 
 # ============================================================
-#  账号自动检测（兼容 WEIRDHOST_COOKIE_1..5 + WEIRDHOST_ACCOUNTS/ACCOUNTS）
+#  账号自动检测
 # ============================================================
 
 def parse_account_config(raw_value):
@@ -198,7 +199,6 @@ def parse_account_config(raw_value):
 
 def detect_accounts():
     accounts = []
-    # 1) WEIRDHOST_COOKIE_1..5 优先
     for i in range(1, MAX_COOKIE_COUNT + 1):
         env_name = f"WEIRDHOST_COOKIE_{i}"
         raw = os.environ.get(env_name, "").strip()
@@ -220,7 +220,7 @@ def detect_accounts():
         })
     if accounts:
         return accounts
-    # 2) 兼容 WEIRDHOST_ACCOUNTS / ACCOUNTS JSON
+
     for key in ("WEIRDHOST_ACCOUNTS", "ACCOUNTS"):
         raw = os.environ.get(key, "").strip()
         if not raw:
@@ -230,7 +230,6 @@ def detect_accounts():
             if not isinstance(data, list):
                 continue
             for idx, item in enumerate(data):
-                # 支持 {"cookie": "remember_web..."} 或字符串
                 if isinstance(item, dict):
                     c = item.get("cookie") or item.get("cookie_str") or ""
                     remark = item.get("remark") or item.get("name") or f"账号{idx+1}"
@@ -272,7 +271,7 @@ async def tg_notify(message):
         try:
             await session.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             )
         except Exception as e:
             print(f"[ERROR] TG 发送失败: {e}")
@@ -300,7 +299,6 @@ def sync_tg_notify(message):
     try:
         asyncio.run(tg_notify(message))
     except RuntimeError:
-        # 已在事件循环中时
         loop = asyncio.new_event_loop()
         loop.run_until_complete(tg_notify(message))
 
@@ -314,7 +312,7 @@ def sync_tg_notify_photo(photo_path, caption=""):
 
 
 # ============================================================
-#  GitHub Secret 回写（可选）
+#  GitHub Secret 回写
 # ============================================================
 
 def encrypt_secret(public_key, secret_value):
@@ -343,9 +341,11 @@ async def update_github_secret(secret_name, secret_value):
                 pk_data = await resp.json()
             encrypted_value = encrypt_secret(pk_data["key"], secret_value)
             secret_url = f"https://api.github.com/repos/{repository}/actions/secrets/{secret_name}"
-            async with session.put(secret_url, headers=headers, json={
-                "encrypted_value": encrypted_value, "key_id": pk_data["key_id"]
-            }) as resp:
+            async with session.put(
+                secret_url,
+                headers=headers,
+                json={"encrypted_value": encrypted_value, "key_id": pk_data["key_id"]},
+            ) as resp:
                 return resp.status in (201, 204)
         except Exception:
             return False
@@ -392,7 +392,7 @@ def get_xsrf_token_from_cookies(sb):
 
 
 # ============================================================
-#  Turnstile 处理（精简版：去 xdotool，保留 UC + JS）
+#  Turnstile 处理
 # ============================================================
 
 def ts_exists(sb):
@@ -459,14 +459,10 @@ def focus_turnstile_area(sb):
 
 
 def is_cf_challenge_page(sb):
-    """检测是否仍在 Cloudflare 质询页（Managed Challenge）"""
     try:
-        url = sb.get_current_url() or ""
         src = sb.get_page_source() or ""
-        # Cloudflare 质询页特征：标题含 Cloudflare / Ray ID / challenges
         if "challenges.cloudflare.com" in src or "Ray ID:" in src or "Attention Required" in src:
             return True
-        # 若当前页面标题或 body 仅有 hub.weirdhost.xyz + Cloudflare 标志，多为未过盾
         title = sb.execute_script("return document.title||''") or ""
         if "Cloudflare" in title:
             return True
@@ -476,8 +472,6 @@ def is_cf_challenge_page(sb):
 
 
 def handle_turnstile(sb, timeout=150):
-    """登录阶段 Turnstile + Cloudflare Managed Challenge：UC 自动 + JS 点击兜底，等待跳出质询页"""
-    # 先等页面加载，若是完整的 CF 质询页则不以 ts_exists 为唯一判断
     for _ in range(5):
         if ts_exists(sb) or is_cf_challenge_page(sb):
             break
@@ -487,7 +481,6 @@ def handle_turnstile(sb, timeout=150):
     print("[INFO] 检测到 Turnstile/Cloudflare 验证，尝试自动解决...")
     try:
         sb.uc_gui_handle_captcha()
-        # UC 处理后等 5s 看是否已跳出质询页
         for _ in range(5):
             time.sleep(1)
             if not ts_exists(sb) and not is_cf_challenge_page(sb):
@@ -555,7 +548,7 @@ def handle_turnstile(sb, timeout=150):
                     sb.driver.switch_to.default_content()
                 except Exception:
                     pass
-            # 主文档内也尝试点击可见的 checkbox 区域
+
             if not clicked:
                 try:
                     sb.execute_script("""
@@ -564,7 +557,7 @@ def handle_turnstile(sb, timeout=150):
                     """)
                 except Exception:
                     pass
-            # 坐标点击兜底（替代 xdotool）：用 ActionChains 点击 iframe 中心偏移
+
             if not clicked:
                 try:
                     coords = sb.execute_script("""
@@ -573,19 +566,17 @@ def handle_turnstile(sb, timeout=150):
                         var r=ifr.getBoundingClientRect();
                         return {x:r.x, y:r.y, w:r.width, h:r.height};
                     """)
-                    if coords and coords.get('w',0) > 0:
-                        # 点击 iframe 左侧 30px 处（复刻 oyz8 坐标逻辑）
+                    if coords and coords.get('w', 0) > 0:
                         from selenium.webdriver.common.action_chains import ActionChains
-                        # 先滚到可见
-                        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", sb.driver.find_element("css selector", "iframe"))
-                        time.sleep(0.5)
-                        # 用 ActionChains 在视口坐标点击（selenium 4 支持 move_to_element_with_offset 需元素）
                         iframe_el = sb.driver.find_element("css selector", "iframe")
-                        ActionChains(sb.driver).move_to_element_with_offset(iframe_el, 30, int(coords['h']/2)).click().perform()
+                        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", iframe_el)
+                        time.sleep(0.5)
+                        ActionChains(sb.driver).move_to_element_with_offset(iframe_el, 30, int(coords['h'] / 2)).click().perform()
                         print(f"[INFO] 坐标点击 iframe 偏移 30,{int(coords['h']/2)}")
                         clicked = True
                 except Exception as e:
                     print(f"[WARN] 坐标点击失败: {e}")
+
             if not clicked:
                 try:
                     sb.uc_gui_click_captcha()
@@ -595,7 +586,6 @@ def handle_turnstile(sb, timeout=150):
             last_action = now
         time.sleep(2)
     print("[ERROR] Turnstile 处理超时")
-    # 超时前保存现场
     try:
         sb.save_screenshot("cf_timeout.png")
     except Exception:
@@ -604,7 +594,7 @@ def handle_turnstile(sb, timeout=150):
 
 
 # ============================================================
-#  续期弹窗 Turnstile（精简：纯 JS 点击）
+#  续期弹窗 Turnstile
 # ============================================================
 
 def check_turnstile_exists_popup(sb):
@@ -650,9 +640,7 @@ EXPAND_POPUP_JS = """
 
 
 def click_turnstile_checkbox_js(sb):
-    """纯 JS 点击 Turnstile checkbox（替代 xdotool）"""
     try:
-        # 优先 iframe 内 JS 点击
         iframes = sb.driver.find_elements("css selector", "iframe")
         for iframe in iframes:
             src = iframe.get_attribute("src") or ""
@@ -676,7 +664,6 @@ def click_turnstile_checkbox_js(sb):
                         sb.driver.switch_to.default_content()
                     except Exception:
                         pass
-        # 兜底：直接在主文档 dispatch
         clicked = sb.execute_script("""
             var sels=['input[type="checkbox"]','label.cb-lb','.cb-lb'];
             for(var i=0;i<sels.length;i++){
@@ -688,7 +675,6 @@ def click_turnstile_checkbox_js(sb):
         if clicked:
             print("[INFO] 主文档 JS 点击成功")
             return True
-        # 最后兜底 UC
         try:
             sb.uc_gui_click_captcha()
             return True
@@ -1148,10 +1134,8 @@ def send_account_notification(result):
     lines = [f"账号：{account_display}"]
     if status == "cookie_invalid":
         lines.append("状态：⚠️ Cookie 已失效，请及时更新 WEIRDHOST_COOKIE_*")
-        screenshot = None
     elif status == "no_server":
         lines.append("状态：⚠️ 没有服务器")
-        screenshot = None
     else:
         for s in servers:
             lines.append("")
@@ -1219,15 +1203,39 @@ def add_server_time():
     print(f"[INFO] 共 {len(accounts)} 个账号 | 阈值 {RENEW_THRESHOLD_DAYS} 天")
     print("="*60)
     results = []
+
+    # 1. 提取并清理全局代理环境变量（关键：防止污染 Python/Selenium 与本地 ChromeDriver 之间的 HTTP 会话导致 502 Bad Gateway）
+    proxy_url = get_proxy_url()
+    proxy_keys = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
+    saved_proxies = {}
+    for key in proxy_keys:
+        if key in os.environ:
+            saved_proxies[key] = os.environ.pop(key)
+
+    # 显式锁定本地不走代理
+    os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+
     try:
-        proxy_url = get_proxy_url()
-        chromium_arg = "--disable-dev-shm-usage,--no-sandbox,--disable-gpu"
+        # 保留 macOS 真 GPU 渲染特性，仅在 Linux 等容器模式下添加沙箱规避参数
+        chromium_arg = "--disable-dev-shm-usage,--no-sandbox"
+
+        sb_kwargs = {
+            "uc": True,
+            "test": True,
+            "locale": "ko",
+            "headless": False,
+            "chromium_arg": chromium_arg,
+        }
+
+        # 2. 如果存在代理，通过 SeleniumBase 标准 proxy 接口透传至 Chrome
         if proxy_url:
-            chromium_arg += f",--proxy-server={proxy_url}"
-            print(f"[INFO] 已启用家宽代理: {proxy_url.split('@')[-1][:30]}***")
+            sb_kwargs["proxy"] = proxy_url
+            print(f"[INFO] 已启用代理模式: {proxy_url.split('@')[-1][:30]}***")
         else:
             print("[INFO] 未配置代理，直连运行")
-        with SB(uc=True, test=True, locale="ko", headless=False, chromium_arg=chromium_arg) as sb:
+
+        with SB(**sb_kwargs) as sb:
             print("\n[INFO] 浏览器已启动")
             for i, account in enumerate(accounts):
                 result = process_single_account(sb, account, i)
@@ -1244,28 +1252,32 @@ def add_server_time():
         if not results:
             sync_tg_notify(f"🔔 <b>Weirdhost</b>\n\n❌ 浏览器启动失败\n\n<code>{repr(e)}</code>")
         return
+    finally:
+        # 还原环境变量以保障后续步骤兼容性
+        os.environ.update(saved_proxies)
+
     print(f"\n{'='*60}")
     print("[INFO] 全部处理完成")
     print(f"{'='*60}")
-    icons = {"success":"🟢","cooldown":"🟡","skipped":"🔵","cookie_invalid":"🔒","no_server":"📭","error":"❌","timeout":"⚠️"}
+    icons = {"success": "🟢", "cooldown": "🟡", "skipped": "🔵", "cookie_invalid": "🔒", "no_server": "📭", "error": "❌", "timeout": "⚠️"}
     for r in results:
         icon = icons.get(r["status"], "❓")
         print(f"  {icon} {mask_remark(r.get('remark','?'))} ({mask_email(r.get('email',''))}) | {len(r.get('servers',[]))} 个服务器 | {r['status']} | {r.get('message','')}")
 
 
 if __name__ == "__main__":
-    # 支持本地 .env 自动加载（无依赖）
     if os.path.exists(".env") and not os.environ.get("WEIRDHOST_COOKIE_1"):
         try:
             with open(".env", encoding="utf-8") as f:
                 for line in f:
-                    line=line.strip()
+                    line = line.strip()
                     if not line or line.startswith("#") or "=" not in line:
                         continue
-                    k,v=line.split("=",1)
-                    k=k.strip(); v=v.strip().strip('"').strip("'")
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
                     if k and k not in os.environ:
-                        os.environ[k]=v
+                        os.environ[k] = v
             print("[INFO] 已加载 .env")
         except Exception:
             pass
