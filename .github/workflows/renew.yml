@@ -19,12 +19,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 设置 Python 3.11
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: 安装 Chrome (macOS 真 GPU)
         run: |
+          # 禁用 brew 自动升级索引，节省 2-5 分钟 runner 运行时间
+          export HOMEBREW_NO_AUTO_UPDATE=1
           brew install --cask google-chrome 2>/dev/null || true
           "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version || true
 
@@ -42,25 +44,44 @@ jobs:
           PROXY_NODE: ${{ secrets.PROXY_NODE }}
         run: |
           python scripts/vless_helper.py
-          NEED_PROXY=$(grep -q "socks5://127.0.0.1" "$GITHUB_ENV" 2>/dev/null && echo yes || echo no)
-          if [ "$NEED_PROXY" = "yes" ]; then
-            echo "[proxy] 检测到 VLESS，安装 sing-box (macOS)..."
+          
+          # 根据是否生成了配置文件决定是否安装并启动 sing-box
+          if [ -f "/tmp/singbox.json" ]; then
+            echo "[proxy] 检测到节点配置，开始准备 sing-box..."
             SINGBOX_VER="1.11.3"
             UNAME=$(uname -m)
             if [ "$UNAME" = "arm64" ]; then ARCH="arm64"; else ARCH="amd64"; fi
-            # macOS 用 darwin 包，Linux 用 linux 包（此 workflow 已切 macos）
+            
             curl -fsSL -o /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-darwin-${ARCH}.tar.gz"
             tar -xzf /tmp/sing-box.tar.gz -C /tmp
             sudo mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box
             sudo chmod +x /usr/local/bin/sing-box
-            echo "[proxy] 启动 sing-box..."
+            
+            echo "[proxy] 启动 sing-box 后台进程..."
             nohup sing-box run -c /tmp/singbox.json > /tmp/singbox.log 2>&1 &
             sleep 3
-            head -n 50 /tmp/singbox.log || true
-            for i in 1 2 3; do curl -x socks5h://127.0.0.1:10808 -I https://www.cloudflare.com/cdn-cgi/trace --connect-timeout 5 -m 10 && break || sleep 2; done
-            curl -x socks5h://127.0.0.1:10808 https://www.cloudflare.com/cdn-cgi/trace --connect-timeout 5 -m 10 | head -n 10 || echo "[proxy] 代理探活失败，仍将直连重试（真 GPU 直连也可过盾，见技能）"
+            
+            # 代理通道探活测试（尝试 3 次）
+            PROXY_OK=no
+            for i in 1 2 3; do
+              if curl -x socks5h://127.0.0.1:10808 -sI https://www.cloudflare.com/cdn-cgi/trace --connect-timeout 6 -m 10 >/dev/null 2>&1; then
+                PROXY_OK=yes
+                break
+              fi
+              echo "[proxy] 第 $i 次握手尝试未通，等待重试..."
+              sleep 2
+            done
+
+            if [ "$PROXY_OK" = "yes" ]; then
+              echo "[proxy] 代理通道握手测试成功！当前代理 IP 详情："
+              curl -x socks5h://127.0.0.1:10808 -s https://www.cloudflare.com/cdn-cgi/trace --connect-timeout 5 -m 10 | head -n 10
+            else
+              echo "::warning::[proxy] 代理握手失败，以下为 sing-box 实时错误日志："
+              cat /tmp/singbox.log || true
+              echo "[proxy] 后续将以无代理或直连模式尝试（macOS 真 GPU 也可过盾）"
+            fi
           else
-            echo "[proxy] 未配置 VLESS，跳过（真 GPU 直连即可过盾）"
+            echo "[proxy] 未配置 VLESS/代理节点，跳过安装（真 GPU 直连模式）"
           fi
 
       - name: 运行续期脚本
