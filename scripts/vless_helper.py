@@ -1,168 +1,204 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""把 vless:// / trojan:// / ss:// / vmess:// 解析为 sing-box 配置并启动本地 socks/http 代理"""
-import os, json, sys, urllib.parse, subprocess, time, pathlib, base64
 
-def parse_vless(url: str):
-    u = urllib.parse.urlparse(url.strip())
-    if u.scheme != "vless":
-        raise ValueError("not vless")
-    uuid = u.username
-    host = u.hostname
-    port = u.port or 443
-    qs = urllib.parse.parse_qs(u.query)
-    get = lambda k, d="": qs.get(k, [d])[0]
-    path = urllib.parse.unquote(get("path", "/"))
-    ws_host = get("host", host)
-    sni = get("sni", host)
-    fp = get("fp", "chrome")
-    security = get("security", "tls")
-    flow = get("flow", "")
-    insecure = get("insecure", "0") == "1" or get("allowInsecure", "0") == "1"
-    return {
-        "uuid": uuid, "host": host, "port": port,
-        "sni": sni, "ws_host": ws_host, "path": path,
-        "fp": fp, "security": security, "flow": flow, "insecure": insecure,
-        "type": get("type", "ws"),
+import json
+import os
+import sys
+from urllib.parse import parse_qs, unquote, urlparse
+
+
+def mask_secret(val: str) -> str:
+    """脱敏辅助函数，保护构建日志敏感信息"""
+    if not val or len(val) <= 8:
+        return "******"
+    return f"{val[:4]}...{val[-4:]}"
+
+
+def parse_vless(url_str: str) -> dict:
+    """解析标准 VLESS URL 并生成兼容 sing-box 1.11+ 的 outbound 字典"""
+    parsed = urlparse(url_str.strip())
+    if parsed.scheme.lower() != "vless":
+        raise ValueError("提供的链接不是有效的 vless:// 节点链接")
+
+    uuid = parsed.username
+    server = parsed.hostname
+    port = parsed.port or 443
+
+    # 解析 query 参数（parse_qs 默认值是列表）
+    params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
+    security = params.get("security", "none").lower()
+    net_type = params.get("type", "tcp").lower()
+    flow = params.get("flow", "")
+    sni = params.get("sni") or params.get("peer") or ""
+    fingerprint = params.get("fp", "chrome")
+    alpn_str = params.get("alpn", "")
+    alpn = [x.strip() for x in alpn_str.split(",") if x.strip()] if alpn_str else []
+
+    # 基础 Outbound 结构
+    outbound = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": server,
+        "server_port": int(port),
+        "uuid": uuid,
     }
 
-def parse_trojan(url: str):
-    u = urllib.parse.urlparse(url.strip())
-    if u.scheme != "trojan":
-        raise ValueError("not trojan")
-    pwd = urllib.parse.unquote(u.username or "")
-    host = u.hostname
-    port = u.port or 443
-    qs = urllib.parse.parse_qs(u.query)
-    get = lambda k, d="": qs.get(k, [d])[0]
-    path = urllib.parse.unquote(get("path", "/"))
-    ws_host = get("host", host)
-    sni = get("sni", host) or get("peer", host)
-    fp = get("fp", "chrome")
-    security = get("security", "tls")
-    insecure = get("insecure", "0") == "1" or get("allowInsecure", "0") == "1"
-    return {
-        "password": pwd, "host": host, "port": port,
-        "sni": sni, "ws_host": ws_host, "path": path,
-        "fp": fp, "security": security, "insecure": insecure,
-        "type": get("type", "ws"),
-    }
+    # 1. 传输层 (Transport) 处理
+    if net_type == "ws":
+        # 核心互斥保护：WebSocket 绝对不能搭配 flow (如 xtls-rprx-vision)
+        flow = ""
+        ws_path = unquote(params.get("path", "/"))
+        ws_host = params.get("host", sni or server)
+        outbound["transport"] = {
+            "type": "ws",
+            "path": ws_path,
+            "headers": {"Host": ws_host},
+            "max_early_data": 0,
+            "early_data_header_name": "Sec-WebSocket-Protocol",
+        }
+    elif net_type in ("grpc", "gun"):
+        service_name = params.get("serviceName", "")
+        outbound["transport"] = {
+            "type": "grpc",
+            "service_name": service_name,
+        }
+    elif net_type == "httpupgrade":
+        outbound["transport"] = {
+            "type": "httpupgrade",
+            "path": unquote(params.get("path", "/")),
+            "host": params.get("host", sni or server),
+        }
 
-def make_config(p, proto="vless", socks_port=10808, http_port=10809):
-    if proto == "vless":
-        tls_enabled = p["security"] == "tls"
-        outbound = {
-            "type": "vless",
-            "tag": "proxy",
-            "server": p["host"],
-            "server_port": p["port"],
-            "uuid": p["uuid"],
-            "flow": p["flow"] if p["flow"] else None,
-            "packet_encoding": "",
-            "transport": {
-                "type": "ws",
-                "path": p["path"],
-                "headers": {"Host": p["ws_host"]},
-                "max_early_data": 0,
-                "early_data_header_name": "Sec-WebSocket-Protocol"
-            }
-        }
-        if not outbound["flow"]:
-            outbound.pop("flow")
-        if tls_enabled:
-            outbound["tls"] = {
+    # 2. TLS / Reality / Flow 处理
+    if security in ("tls", "reality"):
+        tls_config = {
+            "enabled": True,
+            "server_name": sni if sni else server,
+            "utls": {
                 "enabled": True,
-                "server_name": p["sni"],
-                "insecure": p["insecure"],
-                "utls": {"enabled": True, "fingerprint": p["fp"] or "chrome"}
-            }
-    elif proto == "trojan":
-        tls_enabled = p["security"] == "tls"
-        outbound = {
-            "type": "trojan",
-            "tag": "proxy",
-            "server": p["host"],
-            "server_port": p["port"],
-            "password": p["password"],
-            "transport": {
-                "type": "ws",
-                "path": p["path"],
-                "headers": {"Host": p["ws_host"]},
-            }
+                "fingerprint": fingerprint,
+            },
         }
-        if tls_enabled:
-            outbound["tls"] = {
+
+        if alpn:
+            tls_config["alpn"] = alpn
+
+        if security == "reality":
+            pbk = params.get("pbk", "")
+            sid = params.get("sid", "")
+            tls_config["reality"] = {
                 "enabled": True,
-                "server_name": p["sni"],
-                "insecure": p["insecure"],
-                "utls": {"enabled": True, "fingerprint": p["fp"] or "chrome"}
+                "public_key": pbk,
+                "short_id": sid,
             }
+
+        # flow 仅支持与 TLS/Reality 搭配且在非 WS/gRPC 模式下运行
+        if flow and net_type in ("tcp", ""):
+            outbound["flow"] = flow
+
+        outbound["tls"] = tls_config
     else:
-        raise ValueError(f"unsupported {proto}")
-    cfg = {
-        "log": {"level": "info"},
-        "inbounds": [
-            {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": socks_port},
-            {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": http_port}
-        ],
-        "outbounds": [outbound, {"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"}],
-        "route": {"rules": [], "final": "proxy"}
-    }
-    return cfg
+        # 非 TLS 场景禁用 flow
+        pass
 
-def pick_node():
-    for k in ("NODE_LINK", "VLESS_NODE", "TROJAN_NODE", "WEIRDHOST_PROXY", "PROXY_NODE"):
-        v = os.environ.get(k, "").strip().strip('"').strip("'")
-        if v and v.split("://")[0] in ("vless", "trojan", "vmess", "ss", "socks5", "http", "https"):
-            return v, k
-    return "", ""
+    return outbound
+
+
+def build_singbox_config(outbound: dict) -> dict:
+    """构建完整的 sing-box 运行配置"""
+    return {
+        "log": {
+            "level": "info",
+            "timestamp": True,
+        },
+        "inbounds": [
+            {
+                "type": "socks",
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "listen_port": 10808,
+            },
+            {
+                "type": "http",
+                "tag": "http-in",
+                "listen": "127.0.0.1",
+                "listen_port": 10809,
+            },
+        ],
+        "outbounds": [
+            outbound,
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"},
+        ],
+        "route": {
+            "final": "proxy",
+            "rules": [
+                {"inbound": ["socks-in", "http-in"], "outbound": "proxy"},
+            ],
+        },
+    }
+
 
 def main():
-    node, src = pick_node()
-    if not node:
-        print("[vless_helper] 未检测到节点，跳过")
-        return 0
-    # 直连代理直接透传
-    if node.startswith("socks5://") or node.startswith("http://") or node.startswith("https://"):
-        print(f"[vless_helper] 检测到直连代理 {node[:30]}***，透传")
-        gha_env = os.environ.get("GITHUB_ENV")
-        if gha_env:
-            with open(gha_env, "a") as f:
-                f.write(f"WEIRDHOST_PROXY={node}\n")
-                f.write(f"HTTPS_PROXY={node}\n")
-                f.write(f"HTTP_PROXY={node}\n")
-        return 0
-    scheme = node.split("://")[0]
-    if scheme not in ("vless", "trojan"):
-        print(f"[vless_helper] 暂不支持 {scheme}，仅支持 vless/trojan/socks5/http")
-        return 0
-    print(f"[vless_helper] 检测到 {scheme.upper()} 节点 ({src})，解析中...")
+    # 优先从各环境变量读取节点信息
+    node_link = (
+        os.getenv("NODE_LINK")
+        or os.getenv("VLESS_NODE")
+        or os.getenv("WEIRDHOST_PROXY")
+        or os.getenv("PROXY_NODE")
+        or ""
+    ).strip()
+
+    if not node_link:
+        print("[vless_helper] 未检测到任何节点配置环境变量，跳过代理生成。")
+        return
+
+    if not node_link.startswith("vless://"):
+        print(f"[vless_helper] 检测到代理链接，但非 vless:// 协议，跳过处理。")
+        return
+
+    print("[vless_helper] 检测到 VLESS 节点，正在解析...")
     try:
-        if node.startswith("vless://"):
-            p = parse_vless(node)
-            cfg = make_config(p, proto="vless")
-        elif node.startswith("trojan://"):
-            p = parse_trojan(node)
-            cfg = make_config(p, proto="trojan")
-        else:
-            raise ValueError("unknown scheme")
-        cfg_path = "/tmp/singbox.json"
-        pathlib.Path(cfg_path).write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[vless_helper] 已生成 {cfg_path}")
-        print(json.dumps(cfg, ensure_ascii=False, indent=2)[:2000])
-        # 写 GITHUB_ENV 供下一步使用
-        gha_env = os.environ.get("GITHUB_ENV")
-        if gha_env:
-            with open(gha_env, "a") as f:
-                f.write("WEIRDHOST_PROXY=socks5://127.0.0.1:10808\n")
-                f.write("HTTPS_PROXY=socks5://127.0.0.1:10808\n")
-                f.write("HTTP_PROXY=socks5://127.0.0.1:10808\n")
-            print("[vless_helper] 已写入 GITHUB_ENV，代理指向 socks5://127.0.0.1:10808")
-        return 0
+        outbound = parse_vless(node_link)
     except Exception as e:
-        print(f"[vless_helper] 解析失败: {e}")
-        import traceback; traceback.print_exc()
-        return 1
+        print(f"[vless_helper] 节点解析失败: {e}")
+        sys.exit(1)
+
+    singbox_config = build_singbox_config(outbound)
+
+    # 写入配置文件
+    config_path = "/tmp/singbox.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(singbox_config, f, indent=2, ensure_ascii=False)
+
+    print(f"[vless_helper] 已生成 {config_path}")
+
+    # 日志输出脱敏版配置（避免构建日志泄露凭据）
+    safe_outbound = json.loads(json.dumps(outbound))
+    if "uuid" in safe_outbound:
+        safe_outbound["uuid"] = mask_secret(safe_outbound["uuid"])
+    if "tls" in safe_outbound and "reality" in safe_outbound["tls"]:
+        safe_outbound["tls"]["reality"]["public_key"] = mask_secret(
+            safe_outbound["tls"]["reality"].get("public_key", "")
+        )
+
+    print("[vless_helper] 生效出站配置概要:")
+    print(json.dumps(safe_outbound, indent=2, ensure_ascii=False))
+
+    # 注入 GitHub Actions 环境变量
+    github_env = os.getenv("GITHUB_ENV")
+    if github_env and os.path.exists(github_env):
+        with open(github_env, "a", encoding="utf-8") as f:
+            f.write("all_proxy=socks5://127.0.0.1:10808\n")
+            f.write("ALL_PROXY=socks5://127.0.0.1:10808\n")
+            f.write("http_proxy=http://127.0.0.1:10809\n")
+            f.write("https_proxy=http://127.0.0.1:10809\n")
+            f.write("HTTP_PROXY=http://127.0.0.1:10809\n")
+            f.write("HTTPS_PROXY=http://127.0.0.1:10809\n")
+            f.write("WEIRDHOST_PROXY=socks5://127.0.0.1:10808\n")
+        print("[vless_helper] 已将本地代理成功写入 $GITHUB_ENV")
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
