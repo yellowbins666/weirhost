@@ -36,7 +36,7 @@ RENEWAL_BUTTON_SELECTORS = [
     "//button//span[contains(text(), '연장하기')]/parent::button",
     "//button[contains(text(), '연장하기')]",
     "//button//span[contains(text(), '시간추가')]/parent::button",
-    "//button[contains(text(), '시간추가')]",
+    "//button[contains(text(), '시간추家')]",
     "//button//span[contains(text(), '시간 추가')]/parent::button",
     "//button[contains(text(), '시간 추가')]",
 ]
@@ -392,7 +392,7 @@ def get_xsrf_token_from_cookies(sb):
 
 
 # ============================================================
-#  Turnstile 处理
+#  Turnstile 处理（CDP 内核级无桌面依赖）
 # ============================================================
 
 def ts_exists(sb):
@@ -412,7 +412,7 @@ def ts_solved(sb):
     try:
         return sb.execute_script("""
             var i = document.querySelector('input[name="cf-turnstile-response"]');
-            return i && i.value && i.value.length > 20;
+            return !!(i && i.value && i.value.length > 20);
         """)
     except Exception:
         return False
@@ -428,7 +428,7 @@ def expand_turnstile(sb):
                 for(var i=0;i<20;i++){
                     el=el.parentElement; if(!el) break;
                     var s=window.getComputedStyle(el);
-                    if(s.overflow==='hidden') el.style.overflow='visible';
+                    if(s.overflow==='hidden'||s.overflowX==='hidden'||s.overflowY==='hidden') el.style.overflow='visible';
                     el.style.minWidth='max-content';
                 }
                 document.querySelectorAll('.cf-turnstile').forEach(function(c){
@@ -446,18 +446,6 @@ def expand_turnstile(sb):
         pass
 
 
-def focus_turnstile_area(sb):
-    try:
-        sb.execute_script("""
-            const sels=['.cf-turnstile','iframe[src*="challenges.cloudflare"]','input[name="cf-turnstile-response"]','label.cb-lb','.cb-lb','input[type="checkbox"]'];
-            for(const s of sels){const el=document.querySelector(s); if(el){el.scrollIntoView({block:'center',inline:'center'}); return true;}}
-            window.scrollTo(0, document.body.scrollHeight*0.45); return false;
-        """)
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-
 def is_cf_challenge_page(sb):
     try:
         src = sb.get_page_source() or ""
@@ -471,120 +459,80 @@ def is_cf_challenge_page(sb):
     return False
 
 
-def handle_turnstile(sb, timeout=150):
-    for _ in range(5):
-        if ts_exists(sb) or is_cf_challenge_page(sb):
-            break
-        time.sleep(1)
-    else:
+def handle_turnstile(sb, timeout=120):
+    """
+    针对 macOS CI 无物理桌面权限环境的 Turnstile 穿透策略
+    使用 CDP 原生事件替代 PyAutoGUI
+    """
+    time.sleep(3)
+    if not ts_exists(sb) and not is_cf_challenge_page(sb):
         return True
-    print("[INFO] 检测到 Turnstile/Cloudflare 验证，尝试自动解决...")
-    try:
-        sb.uc_gui_handle_captcha()
-        for _ in range(5):
-            time.sleep(1)
-            if not ts_exists(sb) and not is_cf_challenge_page(sb):
-                print("[INFO] UC 自动解决成功，已跳出验证页")
-                return True
-            if ts_solved(sb) and not is_cf_challenge_page(sb):
-                print("[INFO] Turnstile 令牌已生成")
-                time.sleep(2)
-                if not is_cf_challenge_page(sb):
-                    return True
-    except Exception as e:
-        print(f"[WARN] uc_gui_handle_captcha 异常: {e}")
-    print("[INFO] 进入 JS 点击兜底（最长 150s）...")
-    start = time.time()
-    last_action = 0
-    while time.time() - start < timeout:
-        if not is_cf_challenge_page(sb) and not ts_exists(sb):
-            print("[INFO] 验证页已消失")
-            return True
+
+    print("[INFO] 检测到 Turnstile/Cloudflare 验证，尝试原生交互穿透...")
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
         if ts_solved(sb) and not is_cf_challenge_page(sb):
-            print("[INFO] Turnstile 已通过")
-            time.sleep(3)
-            if not is_cf_challenge_page(sb):
-                return True
+            print("[INFO] Turnstile 令牌已生成！")
+            time.sleep(2)
+            return True
+
+        if not is_cf_challenge_page(sb) and not ts_exists(sb):
+            print("[INFO] 验证页已跳出")
+            return True
+
         expand_turnstile(sb)
-        focus_turnstile_area(sb)
-        now = time.time()
-        if now - last_action > 5:
-            clicked = False
+
+        # 方案 A: 使用 SeleniumBase 的 uc_click 原生 CDP 点击
+        for sel in [
+            "iframe[src*='challenges.cloudflare.com']",
+            ".cf-turnstile",
+            "#cf-turnstile",
+            "input[name='cf-turnstile-response']",
+        ]:
             try:
-                iframes = sb.driver.find_elements("css selector", "iframe")
-                for iframe in iframes:
-                    src = iframe.get_attribute("src") or ""
-                    if "cloudflare" in src or "turnstile" in src or "challenges" in src:
-                        try:
-                            sb.driver.switch_to.frame(iframe)
-                            for sel in ["input[type='checkbox']", "label.cb-lb", ".cb-lb input", "span.cb-lb", "div.cb-lb"]:
-                                try:
-                                    elems = sb.driver.find_elements("css selector", sel)
-                                    for elem in elems:
-                                        if elem.is_displayed():
-                                            sb.execute_script("arguments[0].click(); arguments[0].dispatchEvent(new MouseEvent('click',{bubbles:true}));", elem)
-                                            clicked = True
-                                            print(f"[INFO] iframe 内 JS 点击 {sel}")
-                                            break
-                                    if clicked:
-                                        break
-                                except Exception:
-                                    pass
-                            if clicked:
-                                break
-                        except Exception:
-                            pass
-                        finally:
-                            try:
-                                sb.driver.switch_to.default_content()
-                            except Exception:
-                                pass
-                        if clicked:
-                            break
+                if sb.is_element_visible(sel):
+                    sb.uc_click(sel)
+                    print(f"[INFO] 已对 {sel} 触发 uc_click")
+                    time.sleep(2)
+                    break
             except Exception:
                 pass
-            finally:
-                try:
+
+        if ts_solved(sb) and not is_cf_challenge_page(sb):
+            return True
+
+        # 方案 B: 深入 iframe 内部触发复合真实人机事件
+        try:
+            iframes = sb.driver.find_elements("css selector", "iframe")
+            for iframe in iframes:
+                src = iframe.get_attribute("src") or ""
+                if "cloudflare" in src or "turnstile" in src or "challenges" in src:
+                    sb.driver.switch_to.frame(iframe)
+                    for target in ["input[type='checkbox']", "label.cb-lb", ".cb-lb", "span", "body"]:
+                        elems = sb.driver.find_elements("css selector", target)
+                        for el in elems:
+                            if el.is_displayed():
+                                sb.execute_script("""
+                                    arguments[0].focus();
+                                    arguments[0].click();
+                                    arguments[0].dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+                                    arguments[0].dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+                                    arguments[0].dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                                """, el)
+                                print(f"[INFO] iframe 内已派发复合点击事件: {target}")
+                                time.sleep(1)
+                                break
                     sb.driver.switch_to.default_content()
-                except Exception:
-                    pass
+                    break
+        except Exception:
+            try:
+                sb.driver.switch_to.default_content()
+            except Exception:
+                pass
 
-            if not clicked:
-                try:
-                    sb.execute_script("""
-                        var c=document.querySelector('input[type=\"checkbox\"]')||document.querySelector('label.cb-lb')||document.querySelector('.cb-lb');
-                        if(c){c.click(); c.dispatchEvent(new MouseEvent('click',{bubbles:true}));}
-                    """)
-                except Exception:
-                    pass
+        time.sleep(3)
 
-            if not clicked:
-                try:
-                    coords = sb.execute_script("""
-                        var ifr=document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')||document.querySelector('iframe');
-                        if(!ifr) return null;
-                        var r=ifr.getBoundingClientRect();
-                        return {x:r.x, y:r.y, w:r.width, h:r.height};
-                    """)
-                    if coords and coords.get('w', 0) > 0:
-                        from selenium.webdriver.common.action_chains import ActionChains
-                        iframe_el = sb.driver.find_element("css selector", "iframe")
-                        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", iframe_el)
-                        time.sleep(0.5)
-                        ActionChains(sb.driver).move_to_element_with_offset(iframe_el, 30, int(coords['h'] / 2)).click().perform()
-                        print(f"[INFO] 坐标点击 iframe 偏移 30,{int(coords['h']/2)}")
-                        clicked = True
-                except Exception as e:
-                    print(f"[WARN] 坐标点击失败: {e}")
-
-            if not clicked:
-                try:
-                    sb.uc_gui_click_captcha()
-                    print("[INFO] 已调用 uc_gui_click_captcha 兜底")
-                except Exception:
-                    pass
-            last_action = now
-        time.sleep(2)
     print("[ERROR] Turnstile 处理超时")
     try:
         sb.save_screenshot("cf_timeout.png")
@@ -608,7 +556,7 @@ def check_turnstile_solved_popup(sb):
     try:
         return sb.execute_script("""
             var i=document.querySelector('input[name="cf-turnstile-response"]');
-            return i && i.value && i.value.length > 20;
+            return !!(i && i.value && i.value.length > 20);
         """)
     except Exception:
         return False
@@ -664,6 +612,7 @@ def click_turnstile_checkbox_js(sb):
                         sb.driver.switch_to.default_content()
                     except Exception:
                         pass
+
         clicked = sb.execute_script("""
             var sels=['input[type="checkbox"]','label.cb-lb','.cb-lb'];
             for(var i=0;i<sels.length;i++){
@@ -675,11 +624,16 @@ def click_turnstile_checkbox_js(sb):
         if clicked:
             print("[INFO] 主文档 JS 点击成功")
             return True
-        try:
-            sb.uc_gui_click_captcha()
-            return True
-        except Exception:
-            return False
+
+        # CDP 替代方案：点击 iframe 本身
+        for sel in ["iframe[src*='challenges.cloudflare.com']", ".cf-turnstile"]:
+            try:
+                if sb.is_element_visible(sel):
+                    sb.uc_click(sel)
+                    return True
+            except Exception:
+                pass
+        return False
     except Exception as e:
         print(f"[WARN] JS 点击失败: {e}")
         return False
@@ -1204,7 +1158,7 @@ def add_server_time():
     print("="*60)
     results = []
 
-    # 1. 临时清理污染 Python 与本地 ChromeDriver 通信的环境变量
+    # 1. 临时拔除全局代理环境变量，防止干扰 Python 与本地 ChromeDriver 的 HTTP 连接
     proxy_url = get_proxy_url()
     proxy_keys = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
     saved_proxies = {}
@@ -1226,7 +1180,7 @@ def add_server_time():
             "chromium_arg": chromium_arg,
         }
 
-        # 2. 如果存在代理，通过 SeleniumBase 原生 proxy 参数安全传给 Chrome
+        # 2. 通过 SeleniumBase 原生 proxy 参数安全传递给浏览器
         if proxy_url:
             sb_kwargs["proxy"] = proxy_url
             print(f"[INFO] 已启用代理模式: {proxy_url.split('@')[-1][:30]}***")
