@@ -83,9 +83,8 @@ jobs:
 
       - name: 运行续期脚本
         env:
-          # 双重防线：显式排除本地回环，防止误走代理拦截驱动控制流
+          # 只保留全大写的 NO_PROXY，避免 YAML 键大小写冲突
           NO_PROXY: "localhost,127.0.0.1,::1"
-          no_proxy: "localhost,127.0.0.1,::1"
           WEIRDHOST_COOKIE_1: ${{ secrets.WEIRDHOST_COOKIE_1 }}
           WEIRDHOST_COOKIE_2: ${{ secrets.WEIRDHOST_COOKIE_2 }}
           WEIRDHOST_COOKIE_3: ${{ secrets.WEIRDHOST_COOKIE_3 }}
