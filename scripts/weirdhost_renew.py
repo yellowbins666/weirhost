@@ -45,7 +45,7 @@ RENEW_THRESHOLD_DAYS = float(os.environ.get("RENEW_THRESHOLD_DAYS", "2"))
 
 
 def get_proxy_url():
-    """家宽代理：按优先级读取 WEIRDHOST_PROXY > HTTPS_PROXY > HTTP_PROXY > https_proxy > http_proxy"""
+    """按优先级读取代理配置"""
     for k in ("WEIRDHOST_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
         v = os.environ.get(k, "").strip()
         if v:
@@ -1204,7 +1204,7 @@ def add_server_time():
     print("="*60)
     results = []
 
-    # 1. 提取并清理全局代理环境变量（关键：防止污染 Python/Selenium 与本地 ChromeDriver 之间的 HTTP 会话导致 502 Bad Gateway）
+    # 1. 核心修复：清理污染 Python 本地 HTTP 栈的代理环境变量
     proxy_url = get_proxy_url()
     proxy_keys = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
     saved_proxies = {}
@@ -1212,12 +1212,11 @@ def add_server_time():
         if key in os.environ:
             saved_proxies[key] = os.environ.pop(key)
 
-    # 显式锁定本地不走代理
+    # 锁定本地回环绝不走代理
     os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
 
     try:
-        # 保留 macOS 真 GPU 渲染特性，仅在 Linux 等容器模式下添加沙箱规避参数
         chromium_arg = "--disable-dev-shm-usage,--no-sandbox"
 
         sb_kwargs = {
@@ -1228,7 +1227,7 @@ def add_server_time():
             "chromium_arg": chromium_arg,
         }
 
-        # 2. 如果存在代理，通过 SeleniumBase 标准 proxy 接口透传至 Chrome
+        # 2. 核心修复：通过 SeleniumBase 原生 proxy 参数安全传给 Chrome
         if proxy_url:
             sb_kwargs["proxy"] = proxy_url
             print(f"[INFO] 已启用代理模式: {proxy_url.split('@')[-1][:30]}***")
@@ -1253,7 +1252,6 @@ def add_server_time():
             sync_tg_notify(f"🔔 <b>Weirdhost</b>\n\n❌ 浏览器启动失败\n\n<code>{repr(e)}</code>")
         return
     finally:
-        # 还原环境变量以保障后续步骤兼容性
         os.environ.update(saved_proxies)
 
     print(f"\n{'='*60}")
