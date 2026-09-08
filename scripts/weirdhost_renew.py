@@ -460,96 +460,83 @@ def is_cf_challenge_page(sb):
 
 
 def handle_turnstile(sb, timeout=90):
-    """带严格防卡死超时的 Turnstile 穿透函数"""
+    """强化版 Turnstile 穿透：带状态日志、CDP 聚焦与绝对坐标/空格激活"""
     time.sleep(3)
     start_time = time.time()
     last_action = 0
+    attempt_count = 0
+
+    print("[INFO] 开始检测 Cloudflare 质询状态...")
 
     while time.time() - start_time < timeout:
-        # 1. 优先检测是否已完成或跳出
+        # 1. 验证通过检测
         if ts_solved(sb) and not is_cf_challenge_page(sb):
-            print("[INFO] Turnstile 令牌生成完毕！")
+            print("[INFO] Turnstile 令牌已生成，验证成功！")
             time.sleep(2)
             return True
 
         if not is_cf_challenge_page(sb) and not ts_exists(sb):
-            print("[INFO] 已顺利跳出验证页")
+            print("[INFO] 页面未包含质询盾，顺利通行")
             return True
 
         expand_turnstile(sb)
 
         now = time.time()
-        if now - last_action > 4:
-            clicked = False
+        if now - last_action > 5:
+            attempt_count += 1
+            cur_title = sb.execute_script("return document.title || ''")
+            print(f"[INFO] [尝试 #{attempt_count}] 页面标题: '{cur_title}' | 等待响应中...")
 
-            # 2. 物理坐标精准点击复选框 (x=28, y=center)
+            # 方案 A: 寻找所有可见 iframe 并尝试聚焦 + 派发空格键 / 相对偏移点击
             try:
                 iframes = sb.driver.find_elements("css selector", "iframe")
-                for iframe in iframes:
-                    src = iframe.get_attribute("src") or ""
-                    if any(k in src for k in ("cloudflare", "turnstile", "challenges")):
-                        rect = iframe.rect
-                        if rect.get("width", 0) > 0:
-                            from selenium.webdriver.common.action_chains import ActionChains
-                            ActionChains(sb.driver).move_to_element_with_offset(
-                                iframe, 28, int(rect["height"] / 2)
-                            ).click().perform()
-                            print("[INFO] 已向 Turnstile 复选框派发物理坐标点击")
-                            clicked = True
-                            time.sleep(2)
-                            break
-            except Exception:
-                pass
+                cf_iframes = [
+                    f for f in iframes
+                    if any(k in (f.get_attribute("src") or "") for k in ("cloudflare", "turnstile", "challenges"))
+                ]
+                print(f"[INFO] 页面共检测到 {len(iframes)} 个 iframe (其中 CF 相关: {len(cf_iframes)})")
 
-            # 3. 深入 iframe 派发原生点击链
-            if not clicked:
-                try:
-                    iframes = sb.driver.find_elements("css selector", "iframe")
-                    for iframe in iframes:
-                        src = iframe.get_attribute("src") or ""
-                        if any(k in src for k in ("cloudflare", "turnstile", "challenges")):
-                            sb.driver.switch_to.frame(iframe)
-                            for target in ["input[type='checkbox']", "label.cb-lb", ".cb-lb", "span", "body"]:
-                                elems = sb.driver.find_elements("css selector", target)
-                                for el in elems:
-                                    if el.is_displayed():
-                                        sb.execute_script("""
-                                            arguments[0].focus();
-                                            arguments[0].click();
-                                            arguments[0].dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
-                                            arguments[0].dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
-                                            arguments[0].dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-                                        """, el)
-                                        print(f"[INFO] iframe 内已派发复合点击事件: {target}")
-                                        clicked = True
-                                        break
-                                if clicked:
-                                    break
-                            sb.driver.switch_to.default_content()
-                            if clicked:
-                                break
-                except Exception:
+                for idx, iframe in enumerate(cf_iframes):
                     try:
-                        sb.driver.switch_to.default_content()
-                    except Exception:
-                        pass
+                        sb.execute_script("arguments[0].scrollIntoView({block: 'center'});", iframe)
+                        time.sleep(0.5)
 
-            # 4. CDP uc_click 尝试
-            if not clicked:
-                for sel in ["iframe[src*='challenges.cloudflare.com']", ".cf-turnstile", "#cf-turnstile"]:
-                    try:
-                        if sb.is_element_present(sel):
-                            sb.uc_click(sel)
-                            print(f"[INFO] 已触发 uc_click: {sel}")
-                            break
-                    except Exception:
-                        pass
+                        from selenium.webdriver.common.action_chains import ActionChains
+                        actions = ActionChains(sb.driver)
+                        actions.move_to_element_with_offset(iframe, 30, 32).click().perform()
+                        print(f"[INFO] 已向 CF iframe #{idx+1} 派发相对坐标点击")
+                        time.sleep(1)
+
+                        iframe.send_keys(" ")
+                        print(f"[INFO] 已向 CF iframe #{idx+1} 发送 SPACE 按键")
+                    except Exception as err:
+                        print(f"[WARN] 操作 iframe #{idx+1} 时异常: {err}")
+            except Exception as e:
+                print(f"[WARN] 遍历 iframe 异常: {e}")
+
+            # 方案 B: 视口中心绝对坐标点击（针对全屏居中的质询容器）
+            try:
+                viewport_info = sb.execute_script("""
+                    return {
+                        w: window.innerWidth || document.documentElement.clientWidth,
+                        h: window.innerHeight || document.documentElement.clientHeight
+                    };
+                """)
+                vw = viewport_info.get("w", 1920)
+                vh = viewport_info.get("h", 1080)
+
+                from selenium.webdriver.common.action_chains import ActionChains
+                body = sb.driver.find_element("tag name", "body")
+                ActionChains(sb.driver).move_to_element_with_offset(body, int(vw * 0.42), int(vh * 0.42)).click().perform()
+                print(f"[INFO] 已向屏幕中心预估区域 ({int(vw * 0.42)}, {int(vh * 0.42)}) 派发盲点")
+            except Exception as err:
+                print(f"[WARN] 盲点异常: {err}")
 
             last_action = now
 
         time.sleep(2)
 
-    print("[WARN] Turnstile 处理已达上限，保存现场截图并尝试继续推进...")
+    print("[WARN] Turnstile 处理超时，保存现场截图 cf_stuck_debug.png")
     try:
         sb.save_screenshot("cf_stuck_debug.png")
     except Exception:
@@ -987,8 +974,7 @@ def process_single_account(sb, account, account_index):
     print(f"[INFO] 处理账号 [{account_index + 1}]: {mask_remark(remark)} ({cookie_env})")
     print(f"{'='*60}")
     print(f"[INFO] [步骤1] 访问站点并处理 Cloudflare 验证...")
-    
-    # 核心修复：改用 open 并显式等待，切断 uc_open_with_reconnect 的底层死锁
+
     sb.open(f"https://{DOMAIN}/")
     time.sleep(3)
 
@@ -1181,7 +1167,6 @@ def add_server_time():
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
 
     try:
-        # 核心修复：配置显式窗口尺寸并关闭自动化标记特征，防止无头沙箱挂起
         chromium_arg = "--disable-dev-shm-usage,--no-sandbox,--window-size=1920,1080,--disable-blink-features=AutomationControlled"
 
         sb_kwargs = {
