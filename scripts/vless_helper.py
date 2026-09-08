@@ -24,7 +24,7 @@ def parse_vless(url_str: str) -> dict:
     server = parsed.hostname
     port = parsed.port or 443
 
-    # 解析 query 参数（parse_qs 默认值是列表）
+    # 解析 query 参数
     params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
 
     security = params.get("security", "none").lower()
@@ -44,9 +44,8 @@ def parse_vless(url_str: str) -> dict:
         "uuid": uuid,
     }
 
-    # 1. 传输层 (Transport) 处理
+    # 1. 传输层处理：WS 模式下强制剔除 flow（解决协议冲突）
     if net_type == "ws":
-        # 核心互斥保护：WebSocket 绝对不能搭配 flow (如 xtls-rprx-vision)
         flow = ""
         ws_path = unquote(params.get("path", "/"))
         ws_host = params.get("host", sni or server)
@@ -93,14 +92,10 @@ def parse_vless(url_str: str) -> dict:
                 "short_id": sid,
             }
 
-        # flow 仅支持与 TLS/Reality 搭配且在非 WS/gRPC 模式下运行
         if flow and net_type in ("tcp", ""):
             outbound["flow"] = flow
 
         outbound["tls"] = tls_config
-    else:
-        # 非 TLS 场景禁用 flow
-        pass
 
     return outbound
 
@@ -141,7 +136,6 @@ def build_singbox_config(outbound: dict) -> dict:
 
 
 def main():
-    # 优先从各环境变量读取节点信息
     node_link = (
         os.getenv("NODE_LINK")
         or os.getenv("VLESS_NODE")
@@ -155,7 +149,7 @@ def main():
         return
 
     if not node_link.startswith("vless://"):
-        print(f"[vless_helper] 检测到代理链接，但非 vless:// 协议，跳过处理。")
+        print("[vless_helper] 检测到代理链接，但非 vless:// 协议，跳过处理。")
         return
 
     print("[vless_helper] 检测到 VLESS 节点，正在解析...")
@@ -167,14 +161,13 @@ def main():
 
     singbox_config = build_singbox_config(outbound)
 
-    # 写入配置文件
     config_path = "/tmp/singbox.json"
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(singbox_config, f, indent=2, ensure_ascii=False)
 
     print(f"[vless_helper] 已生成 {config_path}")
 
-    # 日志输出脱敏版配置（避免构建日志泄露凭据）
+    # 日志脱敏
     safe_outbound = json.loads(json.dumps(outbound))
     if "uuid" in safe_outbound:
         safe_outbound["uuid"] = mask_secret(safe_outbound["uuid"])
@@ -186,7 +179,7 @@ def main():
     print("[vless_helper] 生效出站配置概要:")
     print(json.dumps(safe_outbound, indent=2, ensure_ascii=False))
 
-    # 注入 GitHub Actions 环境变量
+    # 写入环境变量（必须注入 NO_PROXY 防止误拦截 ChromeDriver）
     github_env = os.getenv("GITHUB_ENV")
     if github_env and os.path.exists(github_env):
         with open(github_env, "a", encoding="utf-8") as f:
@@ -196,8 +189,10 @@ def main():
             f.write("https_proxy=http://127.0.0.1:10809\n")
             f.write("HTTP_PROXY=http://127.0.0.1:10809\n")
             f.write("HTTPS_PROXY=http://127.0.0.1:10809\n")
+            f.write("no_proxy=localhost,127.0.0.1,::1\n")
+            f.write("NO_PROXY=localhost,127.0.0.1,::1\n")
             f.write("WEIRDHOST_PROXY=socks5://127.0.0.1:10808\n")
-        print("[vless_helper] 已将本地代理成功写入 $GITHUB_ENV")
+        print("[vless_helper] 已将本地代理及 NO_PROXY 写入 $GITHUB_ENV")
 
 
 if __name__ == "__main__":
